@@ -1,0 +1,19 @@
+// C++ code
+//
+
+int verde = 13;
+int rojo = 11;
+
+void setup()
+{
+  pinMode(verde, OUTPUT);
+  pinMode(rojo, OUTPUT);
+  Serial.begin(9600);
+  
+}
+
+void loop()
+{
+  digitalWrite(13 , HIGH);
+  digitalWrite(11 , HIGH);
+}
