@@ -1,0 +1,82 @@
+#define S0 4
+#define S1 5
+#define S2 6
+#define S3 7
+#define sensorOut 8
+
+int rojoFrecuencia = 0;
+int verdeFrecuencia = 0;
+int azulFrecuencia = 0;
+
+// === TUS VALORES DE CALIBRACIÓN ===
+int redMin = 30;    int redMax = 200;
+int greenMin = 32;  int greenMax = 220;
+int blueMin = 28;   int blueMax = 190;
+// ==================================
+
+int R, G, B;
+
+void setup() {
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+  pinMode(sensorOut, INPUT);
+
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+
+  Serial.begin(9600);
+}
+
+void loop() {
+  // --- Lectura de Frecuencias ---
+  digitalWrite(S2, LOW); digitalWrite(S3, LOW);
+  rojoFrecuencia = pulseIn(sensorOut, LOW);
+  R = constrain(map(rojoFrecuencia, redMin, redMax, 255, 0), 0, 255);
+
+  digitalWrite(S2, HIGH); digitalWrite(S3, HIGH);
+  verdeFrecuencia = pulseIn(sensorOut, LOW);
+  G = constrain(map(verdeFrecuencia, greenMin, greenMax, 255, 0), 0, 255);
+
+  digitalWrite(S2, LOW); digitalWrite(S3, HIGH);
+  azulFrecuencia = pulseIn(sensorOut, LOW);
+  B = constrain(map(azulFrecuencia, blueMin, blueMax, 255, 0), 0, 255);
+
+  // --- Mapeo de Colores Ampliado ---
+  int brilloPromedio = (R + G + B) / 3;
+  int diffMaxMin = max(R, max(G, B)) - min(R, min(G, B)); // Variación entre canales
+
+  Serial.print("RGB: ("); Serial.print(R); Serial.print(", ");
+  Serial.print(G); Serial.print(", "); Serial.print(B); Serial.print(") -> ");
+
+  // 1. Detección de Colores Neutros (Blanco, Negro, Gris)
+  if (diffMaxMin < 30) { 
+    if (brilloPromedio < 40) {
+      Serial.println("COLOR: NEGRO");
+    } else if (brilloPromedio > 200) {
+      Serial.println("COLOR: BLANCO");
+    } else {
+      Serial.println("COLOR: GRIS");
+    }
+  } 
+  // 2. Detección de Colores Cromáticos (Primarios y Secundarios)
+  else {
+    if (R > G && R > B) {
+      if (G > (R * 0.7)) Serial.println("COLOR: AMARILLO");
+      else if (B > (R * 0.7)) Serial.println("COLOR: MAGENTA / ROSA");
+      else Serial.println("COLOR: ROJO");
+    } 
+    else if (G > R && G > B) {
+      if (B > (G * 0.7)) Serial.println("COLOR: CIAN / CELESTE");
+      else Serial.println("COLOR: VERDE");
+    } 
+    else if (B > R && B > G) {
+      if (R > (B * 0.7)) Serial.println("COLOR: MAGENTA / VIOLETA");
+      else if (G > (B * 0.7)) Serial.println("COLOR: CIAN / CELESTE");
+      else Serial.println("COLOR: AZUL");
+    }
+  }
+
+  delay(600);
+}
