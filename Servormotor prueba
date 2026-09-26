@@ -1,0 +1,36 @@
+#include <Servo.h>
+
+Servo miServo; // Crear objeto Servo para controlar el SG90
+
+void setup() {
+  // Inicializa el servo en el pin 9 PWM del Arduino MEGA
+  miServo.attach(9);
+}
+
+void loop() {
+  // 1. Barrido suave de 0 a 180 grados
+  for (int pos = 0; pos <= 180; pos += 1) {
+    miServo.write(pos);
+    delay(15); // Pausa para permitir que el motor alcance la posición
+  }
+
+  delay(1000); // Pausa de 1 segundo en la posición de 180°
+
+  // 2. Barrido suave de 180 a 0 grados
+  for (int pos = 180; pos >= 0; pos -= 1) {
+    miServo.write(pos);
+    delay(15);
+  }
+
+  delay(1000); // Pausa de 1 segundo en la posición de 0°
+
+  // 3. Prueba de posiciones fijas (pasos rápidos)
+  miServo.write(0);   // Ir a 0°
+  delay(1000);
+
+  miServo.write(90);  // Ir a 90° (Centro)
+  delay(1000);
+
+  miServo.write(180); // Ir a 180°
+  delay(1000);
+}
