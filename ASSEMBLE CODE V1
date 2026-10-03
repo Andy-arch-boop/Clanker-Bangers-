@@ -1,0 +1,301 @@
+#include <Wire.h>
+
+// ===================================================
+// CODIGO PARA GORILA V1
+// ===================================================
+
+const int COLOR_OUT = 22, COLOR_S0 = 23, COLOR_S1 = 24, COLOR_S2 = 25, COLOR_S3 = 26;
+const int ENA = 2, IN1 = 27, IN2 = 28, IN3 = 29, IN4 = 30, ENB = 3;
+const int TRIG_FRENTE = 4, ECHO_FRENTE = 31;
+const int TRIG_IZQ = 5, ECHO_IZQ = 32;
+const int TRIG_DER = 6, ECHO_DER = 33;
+const int GYRO_INT = 34, MPU_ADDR = 0x68;
+const int LED_R = 7, LED_G = 8, LED_B = 9;
+
+// ===================================================
+// PARÁMETROS Y ESTADOS DE NAVEGACIÓN
+// ===================================================
+int velIzquierda = 200, velDerecha = 180; 
+const int UMBRAL_OBSTACULO = 15; 
+const int UMBRAL_PASILLO = 10; 
+
+int redMin = 30, redMax = 200, greenMin = 32, greenMax = 220, blueMin = 28, blueMax = 190;
+int R, G, B;
+int distFrente = 0, distIzq = 0, distDer = 0;
+
+// Máquina de estados para el Protocolo del Color Rosa
+enum FaseRuta { BUSCANDO_ROSA, REGRESANDO_INICIO, RECORRIDO_NORMAL };
+FaseRuta faseActual = BUSCANDO_ROSA;
+
+// ===================================================
+// BRÚJULA Y GIROSCOPIO
+// ===================================================
+float gyroZOffset = 0;
+float anguloActual = 0.0; 
+unsigned long ultimoTiempoGyro = 0;
+
+// 0: NORTE (Frente libre inicial), 1: ESTE, 2: SUR, 3: OESTE
+int orientacionActual = 0; 
+const char* NOMBRES_RUMBO[] = {"NORTE", "ESTE", "SUR", "OESTE"};
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(COLOR_OUT, INPUT);
+  pinMode(COLOR_S0, OUTPUT); pinMode(COLOR_S1, OUTPUT);
+  pinMode(COLOR_S2, OUTPUT); pinMode(COLOR_S3, OUTPUT);
+  digitalWrite(COLOR_S0, HIGH); digitalWrite(COLOR_S1, LOW);
+
+  pinMode(TRIG_FRENTE, OUTPUT); pinMode(ECHO_FRENTE, INPUT);
+  pinMode(TRIG_IZQ, OUTPUT);    pinMode(ECHO_IZQ, INPUT);
+  pinMode(TRIG_DER, OUTPUT);    pinMode(ECHO_DER, INPUT);
+
+  pinMode(GYRO_INT, INPUT);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
+  
+  calibrarGiroscopio();
+  ultimoTiempoGyro = millis();
+
+  pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT);
+  mostrarColorRGB(0, 0, 0); // Ya no marcará error
+  detener();
+}
+
+void loop() {
+  actualizarAnguloGyro();
+
+  distFrente = medirDistancia(TRIG_FRENTE, ECHO_FRENTE);
+  distIzq    = medirDistancia(TRIG_IZQ, ECHO_IZQ);
+  distDer    = medirDistancia(TRIG_DER, ECHO_DER);
+
+  String colorDetectado = obtenerColor();
+  actualizarLEDColor(colorDetectado);
+
+  // ===================================================
+  // PROTOCOLO DE COLORES: CAPTURA DE ROSA Y REGRESO
+  // ===================================================
+  if (faseActual == BUSCANDO_ROSA && colorDetectado == "ROSA") {
+    detener(); delay(500);
+    faseActual = REGRESANDO_INICIO;
+    girarConBrujula(2); // Media vuelta (180°)
+    return;
+  } 
+  else if (faseActual == REGRESANDO_INICIO && colorDetectado == "VERDE") {
+    detener(); delay(500);
+    faseActual = RECORRIDO_NORMAL;
+    girarConBrujula(2); // Media vuelta para encarar la pista de nuevo
+    return;
+  }
+
+  String estadoMovimiento = "";
+
+  // ===================================================
+  // MODELO DE DECISIONES MEJORADO
+  // ===================================================
+  
+  // REGLA 1: Frente libre (>= 15cm)
+  if (distFrente >= UMBRAL_OBSTACULO) {
+    // Verificación de pasillo cerrado (paredes en ambos lados a < 10cm)
+    if (distIzq < UMBRAL_PASILLO && distDer < UMBRAL_PASILLO) {
+      estadoMovimiento = "PASILLO ESTRECHO - MANTENIENDO RUMBO " + String(NOMBRES_RUMBO[orientacionActual]);
+    } else {
+      estadoMovimiento = "FRENTE LIBRE - RUMBO " + String(NOMBRES_RUMBO[orientacionActual]);
+    }
+    adelante(velIzquierda, velDerecha);
+  } 
+  // REGLA 2: Frente Obstruido (< 15cm)
+  else {
+    detener();
+    delay(150);
+
+    // Si detecta pared enfrente, y la derecha está obstruida pero izquierda libre -> Gira Izquierda
+    if (distDer < UMBRAL_OBSTACULO && distIzq >= UMBRAL_OBSTACULO) {
+      estadoMovimiento = "OBSTRUIDO FRENTE Y DER -> RUMBO LIBRE (IZQ)";
+      imprimirEstado(estadoMovimiento, colorDetectado);
+      girarConBrujula(-1); 
+    } 
+    // Si detecta pared enfrente, y la izquierda está obstruida pero derecha libre -> Gira Derecha
+    else if (distIzq < UMBRAL_OBSTACULO && distDer >= UMBRAL_OBSTACULO) {
+      estadoMovimiento = "OBSTRUIDO FRENTE E IZQ -> RUMBO LIBRE (DER)";
+      imprimirEstado(estadoMovimiento, colorDetectado);
+      girarConBrujula(1); 
+    } 
+    // Si ambas direcciones laterales están libres -> Prioriza derecha 
+    else if (distIzq >= UMBRAL_OBSTACULO && distDer >= UMBRAL_OBSTACULO) {
+      estadoMovimiento = "LATERALES LIBRES -> GIRANDO DERECHA";
+      imprimirEstado(estadoMovimiento, colorDetectado);
+      girarConBrujula(1); 
+    } 
+    // Si todas las direcciones están obstruidas (Callejón) -> Retrocede y Gira 180°
+    else {
+      estadoMovimiento = "TODO OBSTRUIDO -> RETROCEDIENDO";
+      imprimirEstado(estadoMovimiento, colorDetectado);
+      atras(velIzquierda, velDerecha);
+      delay(400); 
+      detener();
+      girarConBrujula(2); // Giro 180°
+    }
+  }
+
+  imprimirEstado(estadoMovimiento, colorDetectado);
+  delay(40);
+}
+
+// ===================================================
+// NAVEGACIÓN Y BRÚJULA
+// ===================================================
+void girarConBrujula(int cambioOrientacion) {
+  float anguloInicio = anguloActual;
+  float gradosTarget = cambioOrientacion * 90.0;
+  float anguloObjetivo = anguloInicio + gradosTarget;
+
+  if (cambioOrientacion > 0) girarDerecha(velIzquierda, velDerecha);
+  else girarIzquierda(velIzquierda, velDerecha);
+
+  unsigned long tiempoTimeout = millis();
+  while (abs(anguloActual - anguloObjetivo) > 3.0) {
+    actualizarAnguloGyro();
+    if (millis() - tiempoTimeout > 2500) break; 
+    delay(5);
+  }
+  detener();
+  delay(100);
+  orientacionActual = (orientacionActual + cambioOrientacion + 4) % 4;
+}
+
+void actualizarAnguloGyro() {
+  unsigned long tiempoActual = millis();
+  float dt = (tiempoActual - ultimoTiempoGyro) / 1000.0;
+  ultimoTiempoGyro = tiempoActual;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47); 
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 2, true);
+  if (Wire.available() >= 2) {
+    int16_t rawZ = (Wire.read() << 8 | Wire.read());
+    float velocidadZ = (rawZ - gyroZOffset) / 131.0; 
+    if (abs(velocidadZ) > 0.8) anguloActual += velocidadZ * dt;
+  }
+}
+
+void calibrarGiroscopio() {
+  long sumaZ = 0;
+  for (int i = 0; i < 500; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x47); Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 2, true);
+    if (Wire.available() >= 2) sumaZ += (Wire.read() << 8 | Wire.read());
+    delay(2);
+  }
+  gyroZOffset = sumaZ / 500.0;
+}
+
+// ===================================================
+// COLOR Y LÚCES LED (CORREGIDO)
+// ===================================================
+String obtenerColor() {
+  digitalWrite(COLOR_S2, LOW); digitalWrite(COLOR_S3, LOW);
+  R = constrain(map(pulseIn(COLOR_OUT, LOW, 20000), redMin, redMax, 255, 0), 0, 255);
+  digitalWrite(COLOR_S2, HIGH); digitalWrite(COLOR_S3, HIGH);
+  G = constrain(map(pulseIn(COLOR_OUT, LOW, 20000), greenMin, greenMax, 255, 0), 0, 255);
+  digitalWrite(COLOR_S2, LOW); digitalWrite(COLOR_S3, HIGH);
+  B = constrain(map(pulseIn(COLOR_OUT, LOW, 20000), blueMin, blueMax, 255, 0), 0, 255);
+
+  float r = R / 255.0, g = G / 255.0, b = B / 255.0;
+  float cmax = max(r, max(g, b)), cmin = min(r, min(g, b)), delta = cmax - cmin;
+  float H = 0, S = 0, V = cmax * 100.0;
+
+  if (delta != 0) {
+    if (cmax == r) H = 60.0 * fmod(((g - b) / delta), 6.0);
+    else if (cmax == g) H = 60.0 * (((b - r) / delta) + 2.0);
+    else if (cmax == b) H = 60.0 * (((r - g) / delta) + 4.0);
+    if (H < 0) H += 360.0;
+    S = (delta / cmax) * 100.0;
+  }
+
+  if (V < 18) return "NEGRO";
+  if (S < 20) return (V > 65) ? "BLANCO" : "GRIS";
+  if (H >= 345 || H < 12) return "ROJO";
+  if (H >= 12 && H < 38)  return "NARANJA";
+  if (H >= 38 && H < 68)  return "AMARILLO";
+  if (H >= 68 && H < 150) return "VERDE";
+  if (H >= 150 && H < 205) return "CELESTE";
+  if (H >= 205 && H < 260) return "AZUL";
+  if (H >= 260 && H < 345) return "ROSA";
+
+  return "INDEFINIDO";
+}
+
+void mostrarColorRGB(int r, int g, int b) {
+  analogWrite(LED_R, r);
+  analogWrite(LED_G, g);
+  analogWrite(LED_B, b);
+}
+
+void actualizarLEDColor(String color) {
+  if (color == "CELESTE")       mostrarColorRGB(0, 255, 255);
+  else if (color == "AMARILLO") mostrarColorRGB(255, 255, 0);
+  else if (color == "NARANJA")  mostrarColorRGB(255, 80, 0);
+  else if (color == "ROSA")     mostrarColorRGB(255, 20, 147);
+  else if (color == "VERDE")    mostrarColorRGB(0, 255, 0);
+  else if (color == "ROJO")     mostrarColorRGB(255, 0, 0);
+  else                          mostrarColorRGB(0, 0, 0);
+}
+
+// ===================================================
+// ULTRASÓNICOS Y MONITOR SERIAL
+// ===================================================
+int medirDistancia(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW); delayMicroseconds(5);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 25000);
+  return (duration == 0) ? 400 : duration * 0.034 / 2;
+}
+
+void imprimirEstado(String mov, String col) {
+  String faseStr = (faseActual == BUSCANDO_ROSA) ? "BUSCANDO ROSA" : 
+                   (faseActual == REGRESANDO_INICIO) ? "REGRESANDO INICIO" : "NORMAL";
+  Serial.print("Fase: " + faseStr + " | Mov: " + mov + " | Rumbo: " + String(NOMBRES_RUMBO[orientacionActual]));
+  Serial.println(" | Color: " + col + " | F:" + String(distFrente) + " I:" + String(distIzq) + " D:" + String(distDer));
+}
+
+// ===================================================
+// CONTROL MOTORES
+// ===================================================
+void adelante(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void atras(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void girarIzquierda(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void girarDerecha(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void detener() {
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
