@@ -1,5 +1,5 @@
-Ya esta codificado el sensor de distancia, sensor de color y en camino el servomotor mini para la garra 
+YA ESTA CODIFICADO LA PISTA A. Solo falta hacer la prueba en la pista demo antes del concurso pero ya fue probado que si puede detectar y moverse correctamente ante ciertas situaciones.
 
-Lo que no esta codificado es el puente H (%40), codigo del armazon completo del protitpo para prueba de codigos
+Ahora solo falta programar la pista B con la garra
 <img width="500" height="250" alt="image" src="https://github.com/user-attachments/assets/d0c52905-016b-4246-a886-eff0d6f45e9c" />
 
