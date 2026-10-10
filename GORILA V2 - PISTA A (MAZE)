@@ -1,0 +1,626 @@
+// =====================================================================
+//  GORILA V2 - PISTA A (MAZE)  |  Arduino Mega 2560
+//  Candidates 2026
+//
+//  ESTRATEGIA
+//   IDA:     seguir pared DERECHA (decisiones al centro de cada unidad)
+//   REGRESO: seguir pared IZQUIERDA desde la meta. Es el camino inverso
+//            exacto de la ida (mismas unidades, orden inverso) SIN guardar
+//            ningun mapa -> cumple Bonus 1 y no es "pre-mapeo".
+//   Giros con giroscopio, centrado en pasillo con PD, rampa por inclinacion
+//   (acelerometro), LED RGB con "latch" para que el juez vea el color.
+//
+//  !! TODOS los valores marcados con [CALIBRAR] dependen de TU robot !!
+// =====================================================================
+#include <Wire.h>
+#include <math.h>
+
+// ===================== PINES (SIN CAMBIOS) ===========================
+const int COLOR_OUT = 22, COLOR_S0 = 23, COLOR_S1 = 24, COLOR_S2 = 25, COLOR_S3 = 26;
+const int ENA = 2, IN1 = 27, IN2 = 28, IN3 = 29, IN4 = 30, ENB = 3;
+const int TRIG_FRENTE = 4, ECHO_FRENTE = 31;
+const int TRIG_IZQ    = 5, ECHO_IZQ    = 32;
+const int TRIG_DER    = 6, ECHO_DER    = 33;
+const int GYRO_INT = 34;
+const int MPU_ADDR = 0x68;
+const int LED_R = 7, LED_G = 8, LED_B = 9;
+
+// ---- Bonus 2 ArUco (OPCIONAL, hardware NUEVO: camara + Pi/ESP32) -----
+// Pi TX -> Mega RX1 (pin 19) + GND comun. La Pi envia lineas "A<id>\n".
+// Indicador: 6 LEDs en binario (bit0..bit5).
+#define USAR_ARUCO false
+const int ARUCO_LEDS[6] = {40, 41, 42, 43, 44, 45};
+const unsigned long ARUCO_MOSTRAR_MS = 6000;   // regla: >= 3 s continuos
+
+// ===================== DEBUG / CALIBRACION ===========================
+#define DEBUG_SERIAL            true    // 
+#define MODO_CALIBRACION_COLOR  false   // true = solo imprime lecturas del color
+
+// ===================== PARAMETROS DE MOVIMIENTO ======================
+const int   BASE_IZQ = 200;             // tus valores originales
+const int   BASE_DER = 180;
+const float FACTOR_RAMPA = 1.25;        // [CALIBRAR] mas potencia en rampa
+const int   PWM_GIRO_MIN = 130;         // [CALIBRAR] minimo para girar en sitio
+const int   PWM_GIRO_MAX = 190;
+const float KP_GIRO = 2.0;              // PWM por grado de error
+const float TOL_GIRO = 3.0;             // grados
+
+const float KP_PARED = 5.0;             // PWM por cm de error
+const float KD_PARED = 10.0;
+const float LIM_CORR = 60.0;
+const float KP_RUMBO = 3.0;             // PWM por grado (mantener rumbo)
+
+// ===================== PARAMETROS DE DISTANCIA (cm) ==================
+const int DIST_MAX            = 100;
+const int DIST_PARADA_FRENTE  = 8;      // [CALIBRAR] = 15 - (largo_robot/2) para quedar al centro
+const int DIST_CHOQUE         = 5;
+const int UMBRAL_FRENTE_LIBRE = 20;     // desde el centro de la unidad
+const int UMBRAL_ABERTURA     = 22;     // lateral mayor a esto = hueco
+const int DIST_OBJETIVO_LADO  = 7;      // [CALIBRAR] = (30 - ancho_robot)/2
+
+// Estimacion de distancia por tiempo (sin encoders)
+const float CM_POR_SEG          = 20.0; // [CALIBRAR] velocidad real en plano con BASE_*
+const float CM_INHIBIR_ABERTURA = 16.0; // tras un giro, ignorar huecos hasta pasar el limite de unidad
+const float CM_MEDIA_CELDA      = 14.0; // del limite de unidad al centro de la siguiente
+const float CM_TRAS_META        = 10.0; // [CALIBRAR] avanzar tras ver rojo/verde para quedar al centro
+
+// ===================== GIROSCOPIO / ACELEROMETRO =====================
+const float GYRO_ESCALA = 131.0;        // LSB por grado/s (rango +-250)
+const int   GYRO_SIGN   = 1;            // [CALIBRAR] si al pedir giro IZQUIERDO gira derecha, pon -1
+const float PITCH_ON    = 9.0;          // grados para considerar "en rampa"
+const unsigned long MS_SALIDA_RAMPA = 250;
+
+// ===================== SENSOR DE COLOR (TCS3200) =====================
+// [CALIBRAR] con MODO_CALIBRACION_COLOR: min = sobre blanco, max = sobre negro
+int redMin = 30;   int redMax = 200;
+int greenMin = 32; int greenMax = 220;
+int blueMin = 28;  int blueMax = 190;
+const unsigned long TIMEOUT_COLOR = 1500;       // us (antes 20000 -> bloqueaba ~60 ms)
+const unsigned long PERIODO_COLOR = 30;         // ms entre lecturas
+const uint8_t CONF_COLOR = 3;                   // lecturas iguales para confirmar color
+const uint8_t CONF_META  = 5;                   // lecturas iguales para confirmar rojo/verde
+const unsigned long LED_HOLD_MS = 2000;         // el LED mantiene el color detectado
+
+enum Color { C_NEGRO, C_BLANCO, C_GRIS, C_ROJO, C_NARANJA, C_AMARILLO,
+             C_VERDE, C_CELESTE, C_AZUL, C_ROSA, C_INDEF };
+const char* NOMBRE_COLOR[] = {"NEGRO", "BLANCO", "GRIS", "ROJO", "NARANJA", "AMARILLO",
+                              "VERDE", "CELESTE", "AZUL", "ROSA", "INDEF"};
+
+// ===================== ESTADO GLOBAL =================================
+enum Etapa { ETAPA_IDA, ETAPA_REGRESO, ETAPA_FIN };
+Etapa etapa = ETAPA_IDA;
+const int LADO_DER = 1, LADO_IZQ = -1;
+int lado = LADO_DER;                    // pared que se sigue
+
+int distFrente = DIST_MAX, distIzq = DIST_MAX, distDer = DIST_MAX;
+
+// MPU
+float gyroBias = 0, angulo = 0, rumbo = 0, pitch = 0;
+unsigned long tGyro = 0;
+bool enRampa = false;
+unsigned long tUltimoPitch = 0;
+
+// Navegacion
+float cmDesdeGiro = 0;
+float ePrev = 0;
+uint8_t contFrente = 0, contAbertura = 0;
+unsigned long tLoop = 0;
+
+// Color / LED
+int R = 0, G = 0, B = 0;
+Color colorCand = C_INDEF, colorConf = C_INDEF;
+uint8_t contCand = 0;
+unsigned long tColor = 0;
+Color ledColor = C_NEGRO;
+unsigned long ledHasta = 0;
+bool metaDetectada = false;
+
+// ArUco
+int arucoID = -1;
+unsigned long arucoHasta = 0;
+char arucoBuf[8];
+uint8_t arucoLen = 0;
+
+unsigned long tDebug = 0;
+
+// ===================== PROTOTIPOS ====================================
+void servicios();
+void girarGrados(float delta);
+void avanzarCm(float cm, bool abortarEnMeta);
+void decisionEnCentro();
+
+// =====================================================================
+//  SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);                       // 9600 bloqueaba el loop al imprimir
+  Wire.begin();
+  Wire.setClock(400000);
+
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(COLOR_OUT, INPUT);
+  pinMode(COLOR_S0, OUTPUT); pinMode(COLOR_S1, OUTPUT);
+  pinMode(COLOR_S2, OUTPUT); pinMode(COLOR_S3, OUTPUT);
+  digitalWrite(COLOR_S0, HIGH); digitalWrite(COLOR_S1, LOW);   // escala 20 %
+
+  pinMode(TRIG_FRENTE, OUTPUT); pinMode(ECHO_FRENTE, INPUT);
+  pinMode(TRIG_IZQ, OUTPUT);    pinMode(ECHO_IZQ, INPUT);
+  pinMode(TRIG_DER, OUTPUT);    pinMode(ECHO_DER, INPUT);
+  digitalWrite(TRIG_FRENTE, LOW); digitalWrite(TRIG_IZQ, LOW); digitalWrite(TRIG_DER, LOW);
+
+  pinMode(GYRO_INT, INPUT);
+  pinMode(LED_R, OUTPUT); pinMode(LED_G, OUTPUT); pinMode(LED_B, OUTPUT);
+
+  if (USAR_ARUCO) {
+    for (int i = 0; i < 6; i++) { pinMode(ARUCO_LEDS[i], OUTPUT); digitalWrite(ARUCO_LEDS[i], LOW); }
+    Serial1.begin(115200);
+  }
+
+  parar();
+
+  // --- MPU6050: despertar, rangos +-250 deg/s y +-2 g, filtro digital ---
+  escribirMPU(0x6B, 0x00);
+  escribirMPU(0x1A, 0x03);
+  escribirMPU(0x1B, 0x00);
+  escribirMPU(0x1C, 0x00);
+
+  if (MODO_CALIBRACION_COLOR) { calibracionColorSerial(); }
+
+  // --- Arranque: LED azul = NO TOCAR EL ROBOT (calibrando giroscopio) ---
+  mostrarColorRGB(0, 0, 255);
+  delay(1000);
+  calibrarGyro();
+  mostrarColorRGB(0, 0, 0);
+
+  // Si se reinicia SOBRE el rojo (lack of progress en el regreso) -> modo regreso
+  for (int i = 0; i < 8; i++) { colorCand = leerColor(); delay(15); }
+  if (colorCand == C_ROJO) { etapa = ETAPA_REGRESO; lado = LADO_IZQ; }
+
+  tGyro = micros();
+  angulo = 0; rumbo = 0;
+  decisionEnCentro();                      // primera decision desde la casilla de inicio
+  tLoop = millis();
+}
+
+// =====================================================================
+//  LOOP PRINCIPAL
+// =====================================================================
+void loop() {
+  if (etapa == ETAPA_FIN) { parar(); servicios(); return; }
+
+  unsigned long ahora = millis();
+  float dt = (ahora - tLoop) / 1000.0;
+  tLoop = ahora;
+
+  servicios();
+  medirTodo();
+
+  if (metaDetectada) { manejarMeta(); return; }
+
+  actualizarRampa();
+  if (enRampa) {                            // rampa: solo rumbo con giroscopio, mas potencia
+    avanzarRumbo(FACTOR_RAMPA);
+    return;
+  }
+  cmDesdeGiro += CM_POR_SEG * dt;
+
+  // 1) Pared al frente
+  if (distFrente < DIST_PARADA_FRENTE) contFrente++; else contFrente = 0;
+  if (contFrente >= 2) {
+    contFrente = 0;
+    decisionEnCentro();
+    return;
+  }
+
+  // 2) Hueco en el lado de la pared que seguimos
+  if (cmDesdeGiro >= CM_INHIBIR_ABERTURA && distLado() > UMBRAL_ABERTURA) contAbertura++;
+  else contAbertura = 0;
+  if (contAbertura >= 2) {
+    contAbertura = 0;
+    avanzarCm(CM_MEDIA_CELDA, true);        // llegar al centro de la unidad
+    if (!metaDetectada) decisionEnCentro();
+    return;
+  }
+
+  // 3) Camino libre: seguir pared
+  seguirPared();
+  imprimirDebug();
+}
+
+// =====================================================================
+//  DECISION AL CENTRO DE UNA UNIDAD
+//  prioridad: lado de la pared > frente > lado opuesto > media vuelta
+// =====================================================================
+void decisionEnCentro() {
+  detener();
+  delay(80);
+  medirPromedio();
+  int dLado = distLado(), dOp = distOpuesto();
+  const char* acc;
+
+  if (dLado > UMBRAL_ABERTURA)            { acc = "GIRO AL LADO";   girarGrados(-90.0 * lado); }
+  else if (distFrente > UMBRAL_FRENTE_LIBRE) { acc = "RECTO"; }
+  else if (dOp > UMBRAL_ABERTURA)         { acc = "GIRO OPUESTO";   girarGrados( 90.0 * lado); }
+  else                                    { acc = "MEDIA VUELTA";   girarGrados(180.0); }
+
+  cmDesdeGiro = 0; ePrev = 0; rumbo = angulo;
+  contFrente = 0; contAbertura = 0;
+  tLoop = millis();
+  if (DEBUG_SERIAL) { Serial.print("DECISION: "); Serial.println(acc); }
+}
+
+// =====================================================================
+//  META (ROJO en la ida / VERDE en el regreso)
+// =====================================================================
+void manejarMeta() {
+  metaDetectada = false;
+  if (etapa == ETAPA_IDA) {
+    etapa = ETAPA_REGRESO;                  // ya no se vuelve a reaccionar al rojo
+    avanzarCm(CM_TRAS_META, false);
+    detener(); delay(150);
+    medirPromedio();
+
+    // Decision VIRTUAL con regla derecha y orientarse al reves: asi la regla
+    // izquierda reproduce exactamente el camino de ida en orden inverso.
+    float g;
+    if      (distDer > UMBRAL_ABERTURA)        g =  90;   // habria girado a la derecha
+    else if (distFrente > UMBRAL_FRENTE_LIBRE) g = 180;   // habria seguido recto
+    else if (distIzq > UMBRAL_ABERTURA)        g = -90;   // habria girado a la izquierda
+    else                                       g =   0;   // habria dado media vuelta
+    if (g != 0) girarGrados(g);
+
+    lado = LADO_IZQ;
+    decisionEnCentro();
+    if (DEBUG_SERIAL) Serial.println("META: iniciando REGRESO");
+  } else if (etapa == ETAPA_REGRESO) {
+    avanzarCm(CM_TRAS_META, false);
+    detener();
+    etapa = ETAPA_FIN;
+    if (DEBUG_SERIAL) Serial.println("FIN: regreso completado");
+  }
+}
+
+// =====================================================================
+//  SEGUIR PARED CON PD (o mantener rumbo si no hay paredes)
+// =====================================================================
+void seguirPared() {
+  int dl = distLado(), dop = distOpuesto();
+  bool pl = dl  < UMBRAL_ABERTURA;
+  bool po = dop < UMBRAL_ABERTURA;
+  float e;
+
+  if (pl && po)  e = (dl - dop) / 2.0;
+  else if (pl)   e = dl - DIST_OBJETIVO_LADO;
+  else if (po)   e = DIST_OBJETIVO_LADO - dop;
+  else { avanzarRumbo(1.0); return; }
+
+  float de = e - ePrev; ePrev = e;
+  float c = lado * (KP_PARED * e + KD_PARED * de);   // c>0 => girar a la derecha
+  c = constrain(c, -LIM_CORR, LIM_CORR);
+  adelante((int)(BASE_IZQ + c), (int)(BASE_DER - c));
+  rumbo = angulo;                                     // referencia viva para cuando falten paredes
+}
+
+void avanzarRumbo(float factor) {
+  float c = KP_RUMBO * (angulo - rumbo);              // angulo>rumbo => se fue a la izquierda => corregir derecha
+  c = constrain(c, -LIM_CORR, LIM_CORR);
+  int vi = (int)(BASE_IZQ * factor + c);
+  int vd = (int)(BASE_DER * factor - c);
+  adelante(constrain(vi, 0, 255), constrain(vd, 0, 255));
+}
+
+void avanzarCm(float cm, bool abortarEnMeta) {
+  unsigned long dur = (unsigned long)(cm / CM_POR_SEG * 1000.0);
+  unsigned long t0 = millis();
+  while (millis() - t0 < dur) {
+    servicios();
+    if (abortarEnMeta && metaDetectada) break;
+    if (medirDistancia(TRIG_FRENTE, ECHO_FRENTE) < DIST_CHOQUE) break;
+    avanzarRumbo(1.0);
+  }
+  detener();
+  tLoop = millis();
+}
+
+// =====================================================================
+//  GIRO CON GIROSCOPIO  (delta>0 = izquierda, delta<0 = derecha)
+// =====================================================================
+void girarGrados(float delta) {
+  parar(); delay(60);
+  float objetivo = angulo + delta;
+  unsigned long timeout = 1500 + (unsigned long)(15.0 * fabs(delta));
+  unsigned long t0 = millis(), tEstable = 0;
+
+  while (millis() - t0 < timeout) {
+    servicios();
+    float err = objetivo - angulo;
+    if (fabs(err) <= TOL_GIRO) {
+      parar();
+      if (tEstable == 0) tEstable = millis();
+      if (millis() - tEstable > 120) break;
+    } else {
+      tEstable = 0;
+      int pwm = constrain((int)(PWM_GIRO_MIN + KP_GIRO * fabs(err)), PWM_GIRO_MIN, PWM_GIRO_MAX);
+      if (err > 0) girarIzquierda(pwm, pwm); else girarDerecha(pwm, pwm);
+    }
+  }
+  parar();
+  rumbo = angulo; ePrev = 0; cmDesdeGiro = 0;
+  tLoop = millis();
+}
+
+// =====================================================================
+//  SERVICIOS EN SEGUNDO PLANO (se llaman tambien dentro de giros/avances)
+// =====================================================================
+void servicios() {
+  actualizarMPU();
+  if (millis() - tColor >= PERIODO_COLOR) { tColor = millis(); actualizarColor(); }
+  actualizarLED();
+  if (USAR_ARUCO) { leerArucoSerial(); actualizarArucoLEDs(); }
+}
+
+// =====================================================================
+//  MPU6050
+// =====================================================================
+void escribirMPU(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission(true);
+}
+
+// Una sola lectura de 14 bytes: acel XYZ, temp, gyro XYZ.
+// (el original usaba Wire.read()<<8 | Wire.read(): el orden de evaluacion no esta garantizado)
+bool leerMPU(int16_t &ax, int16_t &az, int16_t &gz) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)14, (uint8_t)true);
+  if (Wire.available() < 14) return false;
+  uint8_t b[14];
+  for (int i = 0; i < 14; i++) b[i] = Wire.read();
+  ax = (int16_t)((b[0] << 8) | b[1]);
+  az = (int16_t)((b[4] << 8) | b[5]);
+  gz = (int16_t)((b[12] << 8) | b[13]);
+  return true;
+}
+
+void actualizarMPU() {
+  int16_t ax, az, gz;
+  unsigned long ahora = micros();
+  float dt = (ahora - tGyro) / 1000000.0;
+  tGyro = ahora;
+  if (!leerMPU(ax, az, gz)) return;
+
+  float rate = ((float)gz - gyroBias) / GYRO_ESCALA;       // grados/s
+  if (fabs(rate) < 0.2) rate = 0;                          // zona muerta
+  angulo += GYRO_SIGN * rate * dt;
+
+  // Inclinacion adelante/atras. [CALIBRAR] si montaste el MPU girado, usa ay en lugar de ax
+  float p = atan2((float)ax, (float)az) * 57.2958;
+  pitch = 0.85 * pitch + 0.15 * p;
+}
+
+void calibrarGyro() {
+  long suma = 0; int n = 0;
+  for (int i = 0; i < 500; i++) {
+    int16_t ax, az, gz;
+    if (leerMPU(ax, az, gz)) { suma += gz; n++; }
+    delay(2);
+  }
+  gyroBias = (n > 0) ? (float)suma / n : 0;
+  // acel: inicializa filtro de pitch con el robot en plano
+  int16_t ax, az, gz;
+  if (leerMPU(ax, az, gz)) pitch = atan2((float)ax, (float)az) * 57.2958;
+}
+
+void actualizarRampa() {
+  if (fabs(pitch) > PITCH_ON) { enRampa = true; tUltimoPitch = millis(); }
+  else if (enRampa && millis() - tUltimoPitch > MS_SALIDA_RAMPA) {
+    enRampa = false;
+    cmDesdeGiro = CM_INHIBIR_ABERTURA;      // al salir de la rampa ya se pueden detectar huecos
+    ePrev = 0; contFrente = 0; contAbertura = 0;
+  }
+}
+
+// =====================================================================
+//  ULTRASONICOS (timeout corto: 6 ms ~ 100 cm)
+// =====================================================================
+int medirDistancia(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);  delayMicroseconds(4);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  unsigned long d = pulseIn(echoPin, HIGH, 6000);
+  if (d == 0) return DIST_MAX;
+  int cm = (int)(d * 0.0343 / 2.0);
+  return constrain(cm, 0, DIST_MAX);
+}
+
+void medirTodo() {
+  distFrente = medirDistancia(TRIG_FRENTE, ECHO_FRENTE);
+  distDer    = medirDistancia(TRIG_DER, ECHO_DER);
+  distIzq    = medirDistancia(TRIG_IZQ, ECHO_IZQ);
+}
+
+// Promedio de 3 lecturas para decisiones estaticas
+void medirPromedio() {
+  long f = 0, d = 0, i = 0;
+  for (int k = 0; k < 3; k++) {
+    medirTodo(); f += distFrente; d += distDer; i += distIzq; delay(10);
+  }
+  distFrente = f / 3; distDer = d / 3; distIzq = i / 3;
+}
+
+int distLado()    { return (lado == LADO_DER) ? distDer : distIzq; }
+int distOpuesto() { return (lado == LADO_DER) ? distIzq : distDer; }
+
+// =====================================================================
+//  COLOR
+// =====================================================================
+int leerCanal(bool s2, bool s3, int vmin, int vmax) {
+  digitalWrite(COLOR_S2, s2); digitalWrite(COLOR_S3, s3);
+  delayMicroseconds(400);                                  // asentar el filtro
+  unsigned long p = pulseIn(COLOR_OUT, LOW, TIMEOUT_COLOR);
+  if (p == 0) p = vmax;                                    // timeout = oscuro (antes daba 255 = "muy brillante")
+  return constrain(map((long)p, vmin, vmax, 255, 0), 0, 255);
+}
+
+Color leerColor() {
+  R = leerCanal(LOW,  LOW,  redMin,   redMax);
+  G = leerCanal(HIGH, HIGH, greenMin, greenMax);
+  B = leerCanal(LOW,  HIGH, blueMin,  blueMax);
+
+  float r = R / 255.0, g = G / 255.0, b = B / 255.0;
+  float cmax = max(r, max(g, b)), cmin = min(r, min(g, b));
+  float delta = cmax - cmin;
+  float H = 0, S = 0, V = cmax * 100.0;
+  if (delta != 0) {
+    if (cmax == r)      H = 60.0 * fmod(((g - b) / delta), 6.0);
+    else if (cmax == g) H = 60.0 * (((b - r) / delta) + 2.0);
+    else                H = 60.0 * (((r - g) / delta) + 4.0);
+    if (H < 0) H += 360.0;
+    S = (delta / cmax) * 100.0;
+  }
+
+  if (V < 18) return C_NEGRO;
+  if (S < 20) return (V > 65) ? C_BLANCO : C_GRIS;
+  if (H >= 345 || H < 12)  return C_ROJO;
+  if (H < 38)  return C_NARANJA;
+  if (H < 68)  return C_AMARILLO;
+  if (H < 150) return C_VERDE;
+  if (H < 205) return C_CELESTE;
+  if (H < 260) return C_AZUL;
+  if (H < 345) return C_ROSA;
+  return C_INDEF;
+}
+
+void actualizarColor() {
+  Color c = leerColor();
+  if (c == colorCand) { if (contCand < 255) contCand++; }
+  else { colorCand = c; contCand = 1; }
+
+  // Colores puntuables de la pista A -> mostrar en LED (se mantiene LED_HOLD_MS)
+  if (contCand >= CONF_COLOR && c != colorConf) {
+    colorConf = c;
+    if (c == C_CELESTE || c == C_AMARILLO || c == C_NARANJA || c == C_ROSA) {
+      ledColor = c; ledHasta = millis() + LED_HOLD_MS;
+    }
+  }
+  if (contCand >= CONF_META) {
+    if (etapa == ETAPA_IDA     && c == C_ROJO)  metaDetectada = true;
+    if (etapa == ETAPA_REGRESO && c == C_VERDE) metaDetectada = true;
+  }
+}
+
+void mostrarColorRGB(int r, int g, int b) {
+  analogWrite(LED_R, r); analogWrite(LED_G, g); analogWrite(LED_B, b);
+}
+
+void actualizarLED() {
+  if (millis() > ledHasta) { mostrarColorRGB(0, 0, 0); return; }
+  switch (ledColor) {
+    case C_CELESTE:  mostrarColorRGB(0, 255, 255);   break;
+    case C_AMARILLO: mostrarColorRGB(255, 255, 0);   break;
+    case C_NARANJA:  mostrarColorRGB(255, 80, 0);    break;
+    case C_ROSA:     mostrarColorRGB(255, 20, 147);  break;
+    default:         mostrarColorRGB(0, 0, 0);       break;
+  }
+}
+
+// Imprime pulsos y HSV para ajustar redMin/Max, etc. y los umbrales de hue
+void calibracionColorSerial() {
+  while (true) {
+    unsigned long pr, pg, pb;
+    digitalWrite(COLOR_S2, LOW);  digitalWrite(COLOR_S3, LOW);  delayMicroseconds(400); pr = pulseIn(COLOR_OUT, LOW, 20000);
+    digitalWrite(COLOR_S2, HIGH); digitalWrite(COLOR_S3, HIGH); delayMicroseconds(400); pg = pulseIn(COLOR_OUT, LOW, 20000);
+    digitalWrite(COLOR_S2, LOW);  digitalWrite(COLOR_S3, HIGH); delayMicroseconds(400); pb = pulseIn(COLOR_OUT, LOW, 20000);
+    Color c = leerColor();
+    Serial.print("pulsos R/G/B us: "); Serial.print(pr); Serial.print('/'); Serial.print(pg); Serial.print('/'); Serial.print(pb);
+    Serial.print("  RGB(0-255): "); Serial.print(R); Serial.print('/'); Serial.print(G); Serial.print('/'); Serial.print(B);
+    Serial.print("  -> "); Serial.println(NOMBRE_COLOR[c]);
+    delay(250);
+  }
+}
+
+// =====================================================================
+//  ARUCO (Bonus 2): recibe "A<id>\n" desde la camara y lo muestra en binario
+// =====================================================================
+void leerArucoSerial() {
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (arucoLen > 1 && arucoBuf[0] == 'A') {
+        arucoBuf[arucoLen] = 0;
+        int id = atoi(arucoBuf + 1);
+        if (id >= 0 && id <= 49) { arucoID = id; arucoHasta = millis() + ARUCO_MOSTRAR_MS; }
+      }
+      arucoLen = 0;
+    } else if (arucoLen < sizeof(arucoBuf) - 1) {
+      arucoBuf[arucoLen++] = c;
+    }
+  }
+}
+
+void actualizarArucoLEDs() {
+  bool activo = (arucoID >= 0) && (millis() < arucoHasta);
+  for (int i = 0; i < 6; i++) digitalWrite(ARUCO_LEDS[i], (activo && ((arucoID >> i) & 1)) ? HIGH : LOW);
+}
+
+// =====================================================================
+//  MOTORES
+// =====================================================================
+void adelante(int vIzq, int vDer) {
+  analogWrite(ENA, constrain(vIzq, 0, 255)); analogWrite(ENB, constrain(vDer, 0, 255));
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void atras(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+void girarIzquierda(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void girarDerecha(int vIzq, int vDer) {
+  analogWrite(ENA, vIzq); analogWrite(ENB, vDer);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+}
+
+// Detener sin pausa (se usa dentro de lazos de giro)
+void parar() {
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+// Detener con freno corto (el original llamaba detener() pero NUNCA la definia -> no compilaba)
+void detener() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 255); analogWrite(ENB, 255);
+  delay(25);
+  parar();
+}
+
+// =====================================================================
+//  DEBUG (cada 250 ms, no en cada ciclo)
+// =====================================================================
+void imprimirDebug() {
+  if (!DEBUG_SERIAL || millis() - tDebug < 250) return;
+  tDebug = millis();
+  Serial.print(etapa == ETAPA_IDA ? "IDA" : "REG");
+  Serial.print(" F:"); Serial.print(distFrente);
+  Serial.print(" I:"); Serial.print(distIzq);
+  Serial.print(" D:"); Serial.print(distDer);
+  Serial.print(" ang:"); Serial.print(angulo, 1);
+  Serial.print(" pitch:"); Serial.print(pitch, 1);
+  Serial.print(" col:"); Serial.println(NOMBRE_COLOR[colorConf]);
+}
