@@ -1,0 +1,235 @@
+// =====================================================================
+//  GORILA V2 - PISTA B (NIVELES) | Arduino Mega 2560
+// =====================================================================
+#include <Wire.h>
+#include <math.h>
+#include <Servo.h>
+
+// ===================== PINES =========================================
+const int COLOR_OUT = 22, COLOR_S0 = 23, COLOR_S1 = 24, COLOR_S2 = 25, COLOR_S3 = 26;
+const int ENA = 2, IN1 = 27, IN2 = 28, IN3 = 29, IN4 = 30, ENB = 3;
+const int TRIG_FRENTE = 4, ECHO_FRENTE = 31;
+const int TRIG_IZQ    = 5, ECHO_IZQ    = 32;
+const int TRIG_DER    = 6, ECHO_DER    = 33;
+const int GYRO_INT = 34;
+const int MPU_ADDR = 0x68;
+const int LED_R = 7, LED_G = 8, LED_B = 9;
+const int SERVO_PIN = 10, TRIG_GARRA = 11, ECHO_GARRA = 35; // PINES DE LA GARRA
+
+// ===================== PARAMETROS ====================================
+const int   BASE_IZQ = 200, BASE_DER = 180;
+const int   PWM_GIRO_MIN = 130, PWM_GIRO_MAX = 190;
+const float KP_GIRO = 2.0, TOL_GIRO = 3.0;
+const int   DIST_MAX = 100, UMBRAL_ABERTURA = 22, DIST_PARADA = 8;
+const float CM_POR_SEG = 20.0, CM_MEDIA_CELDA = 15.0;
+
+Servo garra;
+enum Etapa { SEC1_BUSCAR, SEC2_LINEAS, SEC3_COLORES, FIN };
+Etapa etapa = SEC1_BUSCAR;
+
+float angulo = 0, rumbo = 0;
+unsigned long tGyro = 0;
+bool pelotaEnGarra = false;
+
+// ===================== SETUP =========================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(); Wire.setClock(400000);
+  
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  
+  pinMode(COLOR_OUT, INPUT);
+  pinMode(COLOR_S0, OUTPUT); pinMode(COLOR_S1, OUTPUT);
+  pinMode(COLOR_S2, OUTPUT); pinMode(COLOR_S3, OUTPUT);
+  digitalWrite(COLOR_S0, HIGH); digitalWrite(COLOR_S1, LOW);
+  
+  pinMode(TRIG_FRENTE, OUTPUT); pinMode(ECHO_FRENTE, INPUT);
+  pinMode(TRIG_IZQ, OUTPUT); pinMode(ECHO_IZQ, INPUT);
+  pinMode(TRIG_DER, OUTPUT); pinMode(ECHO_DER, INPUT);
+  pinMode(TRIG_GARRA, OUTPUT); pinMode(ECHO_GARRA, INPUT);
+  
+  garra.attach(SERVO_PIN);
+  abrirGarra();
+  
+  escribirMPU(0x6B, 0x00);
+  tGyro = micros();
+  avanzarCm(CM_MEDIA_CELDA);
+}
+
+// ===================== LOOP PRINCIPAL ================================
+void loop() {
+  actualizarMPU();
+  
+  switch(etapa) {
+    case SEC1_BUSCAR:
+      logicaSeccion1();
+      break;
+    case SEC2_LINEAS:
+      logicaSeccion2();
+      break;
+    case SEC3_COLORES:
+      logicaSeccion3();
+      break;
+    case FIN:
+      detener();
+      break;
+  }
+}
+
+// ===================== LOGICA PISTA B ================================
+void logicaSeccion1() {
+  if (!pelotaEnGarra) {
+    int distPelota = medirDistancia(TRIG_GARRA, ECHO_GARRA);
+    if (distPelota > 0 && distPelota < 6) {
+      cerrarGarra();
+      pelotaEnGarra = true;
+      girarGrados(180); // Media vuelta tras agarrar la pelota
+      avanzarCm(30);
+    } else {
+      explorarLaberinto();
+    }
+  } else {
+    // Buscar camino libre al Checkpoint 1 (Rojo)
+    explorarLaberinto();
+    if (leerColorRGB() == 1) { // 1 = ROJO (Checkpoint)
+      etapa = SEC2_LINEAS;
+      avanzarCm(15);
+    }
+  }
+}
+
+void logicaSeccion2() {
+  // Evitar líneas blancas
+  int colorSuelo = leerColorRGB();
+  if (colorSuelo == 2) { // 2 = BLANCO
+    detener();
+    atras(BASE_IZQ, BASE_DER);
+    delay(500);
+    detener();
+    girarGrados(90); // Buscar otra ruta
+  } else if (colorSuelo == 1) { // 1 = ROJO (Checkpoint 2)
+    etapa = SEC3_COLORES;
+    avanzarCm(15);
+  } else {
+    explorarLaberinto();
+  }
+}
+
+void logicaSeccion3() {
+  // Seguir colores del suelo
+  int color = leerColorRGB();
+  if (color == 3) { // CELESTE
+    avanzarCm(CM_MEDIA_CELDA); girarGrados(-90); avanzarCm(CM_MEDIA_CELDA);
+  } else if (color == 4) { // AMARILLO
+    avanzarCm(CM_MEDIA_CELDA); girarGrados(90); avanzarCm(CM_MEDIA_CELDA);
+  } else if (color == 5) { // NARANJA
+    avanzarCm(30);
+  } else if (color == 6) { // ROSA
+    girarGrados(180); avanzarCm(30);
+  } else if (color == 7) { // VERDE (FIN)
+    etapa = FIN;
+  } else {
+    explorarLaberinto();
+  }
+}
+
+// ===================== FUNCIONES AUXILIARES ==========================
+void explorarLaberinto() {
+  int dFrente = medirDistancia(TRIG_FRENTE, ECHO_FRENTE);
+  int dIzq = medirDistancia(TRIG_IZQ, ECHO_IZQ);
+  int dDer = medirDistancia(TRIG_DER, ECHO_DER);
+
+  if (dFrente < DIST_PARADA) {
+    if (dIzq > UMBRAL_ABERTURA) girarGrados(-90);
+    else if (dDer > UMBRAL_ABERTURA) girarGrados(90);
+    else girarGrados(180);
+  } else {
+    avanzarRumbo();
+  }
+}
+
+void abrirGarra() { garra.write(10); } // Calibrar angulo
+void cerrarGarra() { garra.write(90); } // Calibrar angulo
+
+int medirDistancia(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long d = pulseIn(echo, HIGH, 6000);
+  return (d == 0) ? DIST_MAX : (d * 0.0343 / 2.0);
+}
+
+void girarGrados(float delta) {
+  float objetivo = angulo + delta;
+  while (fabs(objetivo - angulo) > TOL_GIRO) {
+    actualizarMPU();
+    if (objetivo > angulo) {
+      analogWrite(ENA, PWM_GIRO_MIN); analogWrite(ENB, PWM_GIRO_MIN);
+      digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); // Izquierda
+      digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+    } else {
+      analogWrite(ENA, PWM_GIRO_MIN); analogWrite(ENB, PWM_GIRO_MIN);
+      digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); // Derecha
+      digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    }
+  }
+  detener();
+  rumbo = angulo;
+}
+
+void avanzarCm(float cm) {
+  unsigned long dur = (cm / CM_POR_SEG) * 1000;
+  unsigned long t0 = millis();
+  while (millis() - t0 < dur) {
+    actualizarMPU();
+    avanzarRumbo();
+  }
+  detener();
+}
+
+void avanzarRumbo() {
+  float err = angulo - rumbo;
+  int vi = BASE_IZQ + (err * KP_GIRO);
+  int vd = BASE_DER - (err * KP_GIRO);
+  analogWrite(ENA, constrain(vi, 0, 255)); analogWrite(ENB, constrain(vd, 0, 255));
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void detener() {
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+}
+
+void atras(int vi, int vd) {
+  analogWrite(ENA, vi); analogWrite(ENB, vd);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void escribirMPU(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg); Wire.write(val);
+  Wire.endTransmission(true);
+}
+
+void actualizarMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x43); // Gyro Z out
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2, (uint8_t)true);
+  int16_t gz = (Wire.read() << 8) | Wire.read();
+  
+  unsigned long ahora = micros();
+  float dt = (ahora - tGyro) / 1000000.0;
+  tGyro = ahora;
+  
+  float rate = gz / 131.0;
+  if (fabs(rate) > 0.2) angulo += rate * dt;
+}
+
+int leerColorRGB() {
+  // Simplificacion para deteccion. Requiere calibrar con TCS3200
+  // Retorna: 1=ROJO, 2=BLANCO, 3=CELESTE, 4=AMARILLO, 5=NARANJA, 6=ROSA, 7=VERDE, 0=OTRO
+  return 0; // Implementar lecturas de pulsos
+}
